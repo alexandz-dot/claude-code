@@ -17,10 +17,16 @@ dependencies = [
     "PyQt6>=6.6",
     "pyqtgraph>=0.13",
     "Pillow>=10.0",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "pytest-qt>=4.2"]
+dev = ["pytest>=7.4", "pytest-qt>=4.2", "responses>=0.24"]
+ai = [
+    "totalsegmentator>=2.0",
+    "nibabel>=5.1",
+    "torch>=2.0",
+]
 
 [project.scripts]
 dicom-reader = "dicom_reader.__main__:main"

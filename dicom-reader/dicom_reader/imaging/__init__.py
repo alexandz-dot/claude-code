@@ -13,6 +13,7 @@ from dicom_reader.imaging.suv import (
 )
 from dicom_reader.imaging.fusion import fuse_pet_ct, resample_to
 from dicom_reader.imaging.reslice import Plane, extract_slice
+from dicom_reader.imaging.mip import SlabMode, slab_projection
 
 __all__ = [
     "CT_PRESETS",
@@ -28,4 +29,6 @@ __all__ = [
     "resample_to",
     "Plane",
     "extract_slice",
+    "SlabMode",
+    "slab_projection",
 ]

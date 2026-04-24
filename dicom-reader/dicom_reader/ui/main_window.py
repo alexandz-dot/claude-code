@@ -7,12 +7,18 @@ from pathlib import Path
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from dicom_reader.ai import is_available as seg_available
+from dicom_reader.ai.masks import SegmentationSet
 from dicom_reader.imaging.fusion import resample_to
+from dicom_reader.imaging.mip import SlabMode
 from dicom_reader.imaging.reslice import Plane
 from dicom_reader.imaging.suv import build_suv_conversion, is_bqml
 from dicom_reader.imaging.windowing import WindowLevel
 from dicom_reader.io.loader import load_path
 from dicom_reader.io.series import Modality, Series
+from dicom_reader.ui.dicomweb_dialog import DicomWebDialog
+from dicom_reader.ui.seg_runner import SegWorker
+from dicom_reader.ui.structures_panel import StructuresPanel
 from dicom_reader.ui.tag_browser import TagBrowser
 from dicom_reader.ui.tools_panel import ToolsPanel
 from dicom_reader.ui.viewport import Viewport
@@ -29,6 +35,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pet: Series | None = None
         self._pet_resampled_to_ct = None  # np.ndarray
         self._suv_factor: float | None = None
+        self._segmentation: SegmentationSet | None = None
+        self._seg_thread: QtCore.QThread | None = None
+        self._seg_worker: SegWorker | None = None
+        self._seg_progress: QtWidgets.QProgressDialog | None = None
 
         self._build_menu()
         self._build_central()
@@ -49,6 +59,10 @@ class MainWindow(QtWidgets.QMainWindow):
         open_file = QtGui.QAction("Open DICOM file…", self)
         open_file.triggered.connect(self._open_file)
         file_menu.addAction(open_file)
+
+        open_web = QtGui.QAction("Open from DICOMweb…", self)
+        open_web.triggered.connect(self._open_dicomweb)
+        file_menu.addAction(open_web)
 
         file_menu.addSeparator()
         quit_act = QtGui.QAction("Quit", self)
@@ -71,6 +85,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._series_picker.setMinimumWidth(240)
         self._series_picker.setMaximumWidth(320)
 
+        self._structures_panel = StructuresPanel()
+
+        left_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        left_splitter.addWidget(self._series_picker)
+        left_splitter.addWidget(self._structures_panel)
+        left_splitter.setStretchFactor(0, 0)
+        left_splitter.setStretchFactor(1, 1)
+        left_splitter.setSizes([180, 500])
+
         self._axial = Viewport(Plane.AXIAL)
         self._coronal = Viewport(Plane.CORONAL)
         self._sagittal = Viewport(Plane.SAGITTAL)
@@ -89,7 +112,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tools = ToolsPanel()
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(self._series_picker)
+        splitter.addWidget(left_splitter)
         splitter.addWidget(viewports_widget)
         splitter.addWidget(self._tools)
         splitter.setStretchFactor(0, 0)
@@ -112,11 +135,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tools.toolChosen.connect(self._apply_tool)
         self._tools.fusionChanged.connect(self._apply_fusion)
         self._tools.suvMethodChanged.connect(self._apply_suv_method)
+        self._tools.slabChanged.connect(self._apply_slab)
+        self._tools.segmentRequested.connect(self._run_segmentation)
+        self._tools.segAlphaChanged.connect(self._apply_seg_alpha)
         self._tools.resetRequested.connect(self._reset_views)
         for vp in self._viewports():
             vp.probed.connect(self._probe_label.setText)
             vp.measured.connect(self._measure_label.setText)
         self._tag_toggle.toggled.connect(self._tag_browser.setVisible)
+        self._structures_panel.visibilityChanged.connect(self._on_structures_changed)
+        self._structures_panel.computeStatsRequested.connect(self._compute_structure_stats)
+        self._refresh_seg_status()
 
     # --- helpers ---
 
@@ -150,6 +179,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ct = next((s for s in series if s.modality == Modality.CT), None)
         self._pet = next((s for s in series if s.modality == Modality.PT), None)
         self._pet_resampled_to_ct = None
+        self._segmentation = None
+        self._structures_panel.set_segmentation(None)
+        for vp in self._viewports():
+            vp.set_segmentation(None)
         self._series_picker.clear()
         for s in series:
             label = f"{s.modality.value}  {s.series_description or s.series_uid[-8:]}  ({s.n_slices} sl)"
@@ -168,6 +201,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for vp in self._viewports():
             vp.set_series(series)
             vp.set_suv_factor(self._suv_factor if series.modality == Modality.PT else None)
+            # Only show the overlay on the series it was computed against
+            if self._segmentation is not None and series.shape == self._segmentation.reference.shape:
+                vp.set_segmentation(self._segmentation)
+            else:
+                vp.set_segmentation(None)
         if series.modality == Modality.CT:
             self._tools.set_window_values(WindowLevel(400, 40))
         elif series.modality == Modality.PT:
@@ -242,6 +280,122 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_views(self) -> None:
         for vp in self._viewports():
             vp._plot.getPlotItem().getViewBox().autoRange()
+
+    # --- slab ---
+
+    def _apply_slab(self, params: dict) -> None:
+        mode = SlabMode(params["mode"])
+        thickness = int(params["thickness"])
+        for vp in self._viewports():
+            vp.set_slab(thickness, mode)
+
+    # --- segmentation ---
+
+    def _refresh_seg_status(self) -> None:
+        if seg_available():
+            self._tools.set_seg_status("TotalSegmentator available.", ok=True)
+        else:
+            self._tools.set_seg_status(
+                "TotalSegmentator not installed. Install with "
+                "`pip install 'dicom-reader[ai]'` to enable anatomical segmentation.",
+                ok=False,
+            )
+
+    def _run_segmentation(self, params: dict) -> None:
+        if self._ct is None:
+            QtWidgets.QMessageBox.warning(
+                self, "No CT", "Load a CT series before running segmentation."
+            )
+            return
+        if self._seg_thread is not None and self._seg_thread.isRunning():
+            return
+
+        self._seg_progress = QtWidgets.QProgressDialog(
+            "Preparing…", "Cancel", 0, 100, self
+        )
+        self._seg_progress.setWindowTitle("Segmentation")
+        self._seg_progress.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        self._seg_progress.setAutoClose(False)
+        self._seg_progress.setValue(1)
+
+        self._seg_thread = QtCore.QThread(self)
+        self._seg_worker = SegWorker(self._ct, params["task"], params["fast"])
+        self._seg_worker.moveToThread(self._seg_thread)
+        self._seg_thread.started.connect(self._seg_worker.run)
+        self._seg_worker.progress.connect(self._on_seg_progress)
+        self._seg_worker.finished.connect(self._on_seg_finished)
+        self._seg_worker.failed.connect(self._on_seg_failed)
+        self._seg_thread.start()
+
+    def _on_seg_progress(self, msg: str, frac: float) -> None:
+        if self._seg_progress is not None:
+            self._seg_progress.setLabelText(msg)
+            self._seg_progress.setValue(int(frac * 100))
+
+    def _on_seg_finished(self, segmentation) -> None:
+        self._close_seg_thread()
+        self._segmentation = segmentation
+        self._structures_panel.set_segmentation(segmentation)
+        for vp in self._viewports():
+            vp.set_segmentation(segmentation)
+
+    def _on_seg_failed(self, message: str) -> None:
+        self._close_seg_thread()
+        QtWidgets.QMessageBox.critical(self, "Segmentation failed", message)
+
+    def _close_seg_thread(self) -> None:
+        if self._seg_progress is not None:
+            self._seg_progress.close()
+            self._seg_progress = None
+        if self._seg_thread is not None:
+            self._seg_thread.quit()
+            self._seg_thread.wait()
+            self._seg_thread = None
+        self._seg_worker = None
+
+    def _apply_seg_alpha(self, alpha: float) -> None:
+        for vp in self._viewports():
+            vp.set_seg_alpha(alpha)
+
+    def _on_structures_changed(self) -> None:
+        for vp in self._viewports():
+            vp.refresh()
+
+    def _compute_structure_stats(self, label_id: int) -> None:
+        if self._segmentation is None:
+            return
+        stats = self._segmentation.structure_stats(label_id)
+        if stats is None:
+            self._structures_panel.set_stats(label_id, "—")
+            return
+        ref = self._segmentation.reference
+        unit = "HU" if ref.modality == Modality.CT else (
+            "Bq/ml" if ref.modality == Modality.PT else "val"
+        )
+        text = (
+            f"V={stats['volume_ml']:.1f} ml  "
+            f"mean={stats['mean']:.1f} {unit}  "
+            f"min={stats['min']:.1f}  max={stats['max']:.1f}"
+        )
+        if (
+            ref.modality == Modality.PT
+            and self._suv_factor is not None
+        ):
+            f = self._suv_factor
+            text += (
+                f"  | SUV mean={stats['mean'] * f:.2f}  "
+                f"max={stats['max'] * f:.2f}"
+            )
+        self._structures_panel.set_stats(label_id, text)
+
+    # --- DICOMweb ---
+
+    def _open_dicomweb(self) -> None:
+        dlg = DicomWebDialog(self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            path = dlg.retrieved_dir()
+            if path is not None:
+                self._load(path)
 
     def _refresh_tag_browser(self, path: Path) -> None:
         if path.is_file():

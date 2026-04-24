@@ -15,6 +15,8 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from dicom_reader.ai.masks import SegmentationSet
+from dicom_reader.imaging.mip import SlabMode, slab_projection
 from dicom_reader.imaging.reslice import Plane, extract_slice, plane_extent
 from dicom_reader.imaging.windowing import WindowLevel, apply_window
 from dicom_reader.imaging.fusion import fuse_pet_ct
@@ -37,6 +39,9 @@ class ViewState:
     fusion_cmap: str = "hot"
     fusion_threshold: float = 0.1
     suv_factor: float | None = None  # Bq/ml -> SUV, if applicable
+    slab_thickness: int = 1  # 1 => single-slice
+    slab_mode: SlabMode = SlabMode.MAX
+    seg_alpha: float = 0.45
 
 
 class Viewport(QtWidgets.QWidget):
@@ -49,6 +54,7 @@ class Viewport(QtWidgets.QWidget):
         self._plane = plane
         self._series: Series | None = None
         self._pet_overlay: np.ndarray | None = None  # PET volume resampled to CT grid
+        self._segmentation: SegmentationSet | None = None
         self._state = ViewState(WindowLevel(400, 40), plane, 0)
 
         self._tool = "probe"  # probe | distance | rect | ellipse
@@ -134,12 +140,25 @@ class Viewport(QtWidgets.QWidget):
     def set_suv_factor(self, factor: float | None) -> None:
         self._state.suv_factor = factor
 
+    def set_segmentation(self, segmentation: SegmentationSet | None) -> None:
+        self._segmentation = segmentation
+        self.refresh()
+
+    def set_seg_alpha(self, alpha: float) -> None:
+        self._state.seg_alpha = float(alpha)
+        self.refresh()
+
+    def set_slab(self, thickness: int, mode: SlabMode) -> None:
+        self._state.slab_thickness = max(1, int(thickness))
+        self._state.slab_mode = mode
+        self.refresh()
+
     # --- Rendering ---
 
     def refresh(self) -> None:
         if self._series is None:
             return
-        slice_ = extract_slice(self._series, self._plane, self._state.slice_index)
+        slice_ = self._extract_display_slice()
         gray = apply_window(slice_, self._state.wl)
         if self._pet_overlay is not None and self._series.modality == Modality.CT:
             pet_slice = self._extract_overlay_slice()
@@ -151,14 +170,60 @@ class Viewport(QtWidgets.QWidget):
                 self._state.fusion_cmap,
                 self._state.fusion_threshold,
             )
-            self._img_item.setImage(rgb, autoLevels=False)
         else:
-            self._img_item.setImage(gray, autoLevels=False)
+            rgb = np.repeat(gray[..., None], 3, axis=-1)
+        if self._segmentation is not None:
+            rgb = self._composite_segmentation(rgb)
+        self._img_item.setImage(rgb, autoLevels=False)
+        slab = self._state.slab_thickness
+        slab_label = f"  slab {slab} ({self._state.slab_mode.value})" if slab > 1 else ""
         self._label.setText(
             f"{self._plane.value.title()}  "
             f"{self._state.slice_index + 1}/{self._slider.maximum() + 1}  "
             f"W/L {int(self._state.wl.width)}/{int(self._state.wl.level)}"
+            f"{slab_label}"
         )
+
+    def _extract_display_slice(self) -> np.ndarray:
+        assert self._series is not None
+        if self._state.slab_thickness > 1:
+            return slab_projection(
+                self._series,
+                self._plane,
+                self._state.slice_index,
+                self._state.slab_thickness,
+                self._state.slab_mode,
+            )
+        return extract_slice(self._series, self._plane, self._state.slice_index)
+
+    def _composite_segmentation(self, rgb: np.ndarray) -> np.ndarray:
+        assert self._segmentation is not None and self._series is not None
+        if self._segmentation.reference.shape != self._series.shape:
+            return rgb  # not registered to this series
+        seg = Series(
+            pixels=self._segmentation.labels.astype(np.float32),
+            spacing=self._series.spacing,
+            origin=self._series.origin,
+            orientation=self._series.orientation,
+            modality=Modality.OTHER,
+        )
+        label_slice = extract_slice(seg, self._plane, self._state.slice_index).astype(np.uint16)
+
+        alpha = float(self._state.seg_alpha)
+        if alpha <= 0:
+            return rgb
+        out = rgb.astype(np.float32)
+        visible_ids = [s for s in self._segmentation.structures if s.visible]
+        if not visible_ids:
+            return rgb
+        for structure in visible_ids:
+            mask = label_slice == structure.label_id
+            if not mask.any():
+                continue
+            color = np.array(structure.color_rgb, dtype=np.float32)
+            m3 = mask[..., None]
+            out = np.where(m3, out * (1.0 - alpha) + color * alpha, out)
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def _extract_overlay_slice(self) -> np.ndarray:
         assert self._series is not None and self._pet_overlay is not None
@@ -205,10 +270,32 @@ class Viewport(QtWidgets.QWidget):
         if coord is None:
             return
         y, x = coord
-        slice_ = extract_slice(self._series, self._plane, self._state.slice_index)
+        slice_ = self._extract_display_slice()
         value = float(slice_[y, x])
         msg = self._format_value(value, y, x)
+        if self._segmentation is not None:
+            organ = self._organ_at(y, x)
+            if organ:
+                msg += f"  [{organ}]"
         self.probed.emit(msg)
+
+    def _organ_at(self, y: int, x: int) -> str | None:
+        assert self._segmentation is not None and self._series is not None
+        if self._segmentation.reference.shape != self._series.shape:
+            return None
+        seg = Series(
+            pixels=self._segmentation.labels.astype(np.float32),
+            spacing=self._series.spacing,
+            origin=self._series.origin,
+            orientation=self._series.orientation,
+            modality=Modality.OTHER,
+        )
+        label_slice = extract_slice(seg, self._plane, self._state.slice_index)
+        label = int(label_slice[y, x])
+        if label == 0:
+            return None
+        structure = self._segmentation.by_id(label)
+        return structure.name if structure else None
 
     def _format_value(self, value: float, y: int, x: int) -> str:
         assert self._series is not None
@@ -256,7 +343,7 @@ class Viewport(QtWidgets.QWidget):
     def _complete_roi(self) -> None:
         assert self._series is not None
         (y0, x0), (y1, x1) = self._tool_points
-        slice_ = extract_slice(self._series, self._plane, self._state.slice_index)
+        slice_ = self._extract_display_slice()
         _, sv, sh = plane_extent(self._series, self._plane)
         self._clear_overlay_items()
         if self._tool == "rect":
