@@ -142,6 +142,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for vp in self._viewports():
             vp.probed.connect(self._probe_label.setText)
             vp.measured.connect(self._measure_label.setText)
+            vp.crosshairMoved.connect(self._broadcast_crosshair)
         self._tag_toggle.toggled.connect(self._tag_browser.setVisible)
         self._structures_panel.visibilityChanged.connect(self._on_structures_changed)
         self._structures_panel.computeStatsRequested.connect(self._compute_structure_stats)
@@ -183,6 +184,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._structures_panel.set_segmentation(None)
         for vp in self._viewports():
             vp.set_segmentation(None)
+            vp.set_crosshair_voxel(None)
         self._series_picker.clear()
         for s in series:
             label = f"{s.modality.value}  {s.series_description or s.series_uid[-8:]}  ({s.n_slices} sl)"
@@ -280,6 +282,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_views(self) -> None:
         for vp in self._viewports():
             vp._plot.getPlotItem().getViewBox().autoRange()
+
+    # --- crosshair ---
+
+    def _broadcast_crosshair(self, k: float, j: float, i: float) -> None:
+        voxel = (float(k), float(j), float(i))
+        for vp in self._viewports():
+            vp.set_crosshair_voxel(voxel)
 
     # --- slab ---
 

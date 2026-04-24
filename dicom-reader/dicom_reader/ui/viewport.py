@@ -16,6 +16,10 @@ import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from dicom_reader.ai.masks import SegmentationSet
+from dicom_reader.imaging.geometry import (
+    plane_pixel_to_voxel,
+    voxel_to_plane_pixel,
+)
 from dicom_reader.imaging.mip import SlabMode, slab_projection
 from dicom_reader.imaging.reslice import Plane, extract_slice, plane_extent
 from dicom_reader.imaging.windowing import WindowLevel, apply_window
@@ -42,12 +46,16 @@ class ViewState:
     slab_thickness: int = 1  # 1 => single-slice
     slab_mode: SlabMode = SlabMode.MAX
     seg_alpha: float = 0.45
+    crosshair_voxel: tuple[float, float, float] | None = None  # (k, j, i) volume
 
 
 class Viewport(QtWidgets.QWidget):
     sliceChanged = QtCore.pyqtSignal(int)
     probed = QtCore.pyqtSignal(str)
     measured = QtCore.pyqtSignal(str)
+    # Volume-voxel tuple (k, j, i). Emitted when the user picks a crosshair
+    # point on this viewport; the main window rebroadcasts to the others.
+    crosshairMoved = QtCore.pyqtSignal(float, float, float)
 
     def __init__(self, plane: Plane, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -57,10 +65,12 @@ class Viewport(QtWidgets.QWidget):
         self._segmentation: SegmentationSet | None = None
         self._state = ViewState(WindowLevel(400, 40), plane, 0)
 
-        self._tool = "probe"  # probe | distance | rect | ellipse
+        self._tool = "probe"  # probe | crosshair | distance | rect | ellipse
         self._tool_points: list[tuple[float, float]] = []
         self._last_roi_item: pg.GraphicsObject | None = None
         self._last_line_item: pg.GraphicsObject | None = None
+        self._crosshair_h: pg.InfiniteLine | None = None
+        self._crosshair_v: pg.InfiniteLine | None = None
 
         self._plot = pg.PlotWidget()
         self._plot.setBackground("k")
@@ -153,6 +163,21 @@ class Viewport(QtWidgets.QWidget):
         self._state.slab_mode = mode
         self.refresh()
 
+    def set_crosshair_voxel(self, voxel: tuple[float, float, float] | None) -> None:
+        """Pin the crosshair to a volume-voxel (k, j, i). Auto-snaps the slice."""
+        self._state.crosshair_voxel = voxel
+        if voxel is not None and self._series is not None:
+            slice_idx, _, _ = voxel_to_plane_pixel(
+                self._series, self._plane, voxel[0], voxel[1], voxel[2]
+            )
+            if 0 <= slice_idx <= self._slider.maximum():
+                # Block the change signal; we are reacting to another viewport.
+                self._slider.blockSignals(True)
+                self._slider.setValue(slice_idx)
+                self._slider.blockSignals(False)
+                self._state.slice_index = slice_idx
+        self.refresh()
+
     # --- Rendering ---
 
     def refresh(self) -> None:
@@ -175,6 +200,7 @@ class Viewport(QtWidgets.QWidget):
         if self._segmentation is not None:
             rgb = self._composite_segmentation(rgb)
         self._img_item.setImage(rgb, autoLevels=False)
+        self._update_crosshair()
         slab = self._state.slab_thickness
         slab_label = f"  slab {slab} ({self._state.slab_mode.value})" if slab > 1 else ""
         self._label.setText(
@@ -183,6 +209,35 @@ class Viewport(QtWidgets.QWidget):
             f"W/L {int(self._state.wl.width)}/{int(self._state.wl.level)}"
             f"{slab_label}"
         )
+
+    def _update_crosshair(self) -> None:
+        voxel = self._state.crosshair_voxel
+        if voxel is None or self._series is None:
+            self._hide_crosshair()
+            return
+        slice_idx, row, col = voxel_to_plane_pixel(
+            self._series, self._plane, voxel[0], voxel[1], voxel[2]
+        )
+        # Only draw if the crosshair point is actually on the current slice
+        if slice_idx != self._state.slice_index:
+            self._hide_crosshair()
+            return
+        pen = pg.mkPen(color=(255, 235, 0, 200), width=1, style=QtCore.Qt.PenStyle.DashLine)
+        if self._crosshair_h is None:
+            self._crosshair_h = pg.InfiniteLine(angle=0, pen=pen, movable=False)
+            self._crosshair_v = pg.InfiniteLine(angle=90, pen=pen, movable=False)
+            self._plot.addItem(self._crosshair_h)
+            self._plot.addItem(self._crosshair_v)
+        self._crosshair_h.setPos(row)
+        self._crosshair_v.setPos(col)
+
+    def _hide_crosshair(self) -> None:
+        if self._crosshair_h is not None:
+            self._plot.removeItem(self._crosshair_h)
+            self._crosshair_h = None
+        if self._crosshair_v is not None:
+            self._plot.removeItem(self._crosshair_v)
+            self._crosshair_v = None
 
     def _extract_display_slice(self) -> np.ndarray:
         assert self._series is not None
@@ -319,6 +374,12 @@ class Viewport(QtWidgets.QWidget):
         if coord is None:
             return
         y, x = coord
+        if self._tool == "crosshair":
+            k, j, i = plane_pixel_to_voxel(
+                self._series, self._plane, self._state.slice_index, float(y), float(x)
+            )
+            self.crosshairMoved.emit(k, j, i)
+            return
         self._tool_points.append((float(y), float(x)))
         if self._tool == "distance" and len(self._tool_points) == 2:
             self._complete_distance()

@@ -155,6 +155,7 @@ class ToolsPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(box)
         self.tool_group = QtWidgets.QButtonGroup(self)
         tools = [
+            ("crosshair", "Crosshair (link MPR views)"),
             ("probe", "Pixel probe"),
             ("distance", "Distance"),
             ("rect", "Rectangular ROI"),
