@@ -139,7 +139,11 @@ def _pixel_spacing(ds: FileDataset) -> tuple[float, float]:
 
 
 def load_series(files: list[Path]) -> Series:
-    """Build a Series from a list of DICOM file paths belonging to one series."""
+    """Build a Series from a list of DICOM file paths belonging to one series.
+
+    Handles both classic single-frame-per-file series and multi-frame DICOM
+    (NumberOfFrames > 1, common for XA, US, NM and enhanced CT/MR).
+    """
     if not files:
         raise ValueError("No files given.")
 
@@ -152,6 +156,9 @@ def load_series(files: list[Path]) -> Series:
 
     if not datasets:
         raise ValueError("None of the provided files could be read as DICOM.")
+
+    if len(datasets) == 1 and int(getattr(datasets[0], "NumberOfFrames", 1) or 1) > 1:
+        return _load_multiframe(datasets[0])
 
     ref = datasets[0]
     row_dir, col_dir = _image_orientation(ref)
@@ -210,9 +217,68 @@ def load_series(files: list[Path]) -> Series:
     )
 
 
+def _load_multiframe(ds: FileDataset) -> Series:
+    """Load a single multi-frame DICOM (NumberOfFrames > 1) as a 3D Series."""
+    arr = ds.pixel_array.astype(np.float32)
+    if arr.ndim == 2:
+        arr = arr[None, :, :]
+    elif arr.ndim != 3:
+        raise ValueError(f"Unexpected multi-frame pixel shape: {arr.shape}")
+
+    slope = _maybe_float(getattr(ds, "RescaleSlope", 1.0)) or 1.0
+    intercept = _maybe_float(getattr(ds, "RescaleIntercept", 0.0)) or 0.0
+    volume = arr * slope + intercept
+
+    row_dir, col_dir = _image_orientation(ds)
+    slice_dir = np.cross(row_dir, col_dir)
+    row_spacing, col_spacing = _pixel_spacing(ds)
+
+    spacing_between = (
+        _maybe_float(getattr(ds, "SpacingBetweenSlices", None))
+        or _maybe_float(getattr(ds, "SliceThickness", 1.0))
+        or 1.0
+    )
+
+    ipp = getattr(ds, "ImagePositionPatient", [0.0, 0.0, 0.0])
+    origin = (float(ipp[0]), float(ipp[1]), float(ipp[2]))
+    orientation = np.column_stack([col_dir, row_dir, slice_dir])
+
+    modality = Modality.from_dicom(str(getattr(ds, "Modality", "") or ""))
+    pet_meta = _collect_pet_metadata(ds) if modality == Modality.PT else None
+
+    return Series(
+        pixels=volume.astype(np.float32),
+        spacing=(float(spacing_between), float(row_spacing), float(col_spacing)),
+        origin=origin,
+        orientation=orientation,
+        modality=modality,
+        study_uid=str(getattr(ds, "StudyInstanceUID", "") or ""),
+        series_uid=str(getattr(ds, "SeriesInstanceUID", "") or ""),
+        series_description=str(getattr(ds, "SeriesDescription", "") or ""),
+        patient_id=str(getattr(ds, "PatientID", "") or ""),
+        patient_name=str(getattr(ds, "PatientName", "") or ""),
+        study_date=str(getattr(ds, "StudyDate", "") or ""),
+        pet=pet_meta,
+        extra={"multiframe": True, "frames": int(volume.shape[0])},
+    )
+
+
 def load_path(path: Path) -> list[Series]:
-    """Load every DICOM series found at `path` (file or directory)."""
+    """Load every DICOM series found at `path` (file, folder, or DICOMDIR)."""
     if path.is_file():
+        if path.name.upper() == "DICOMDIR":
+            from dicom_reader.io.dicomdir import series_files_from_dicomdir
+
+            grouped = series_files_from_dicomdir(path)
+            return [load_series(files) for files in grouped.values() if files]
         return [load_series([path])]
+    # Auto-detect a DICOMDIR at the root of a CD/DVD-style folder
+    candidate = path / "DICOMDIR"
+    if candidate.exists():
+        from dicom_reader.io.dicomdir import series_files_from_dicomdir
+
+        grouped = series_files_from_dicomdir(candidate)
+        if grouped:
+            return [load_series(files) for files in grouped.values() if files]
     groups = discover_series(path)
     return [load_series(files) for files in groups.values() if files]
