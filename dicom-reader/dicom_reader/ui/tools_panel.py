@@ -17,6 +17,7 @@ class ToolsPanel(QtWidgets.QWidget):
     slabChanged = QtCore.pyqtSignal(dict)  # thickness (int), mode (str)
     segmentRequested = QtCore.pyqtSignal(dict)  # task, fast
     segAlphaChanged = QtCore.pyqtSignal(float)
+    displayChanged = QtCore.pyqtSignal(dict)  # invert, flip_v, flip_h, rotations
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -26,6 +27,7 @@ class ToolsPanel(QtWidgets.QWidget):
 
         layout.addWidget(self._build_window_group())
         layout.addWidget(self._build_presets_group())
+        layout.addWidget(self._build_display_group())
         layout.addWidget(self._build_slab_group())
         layout.addWidget(self._build_pet_group())
         layout.addWidget(self._build_fusion_group())
@@ -99,6 +101,61 @@ class ToolsPanel(QtWidgets.QWidget):
         self.pet_vmax.valueChanged.connect(self._emit_fusion)
         form.addRow("SUV max", self.pet_vmax)
         return box
+
+    def _build_display_group(self) -> QtWidgets.QGroupBox:
+        box = QtWidgets.QGroupBox("Display")
+        layout = QtWidgets.QVBoxLayout(box)
+        self._display_state = {
+            "invert": False, "flip_v": False, "flip_h": False, "rotations": 0,
+        }
+
+        row1 = QtWidgets.QHBoxLayout()
+        self.invert_btn = QtWidgets.QPushButton("Invert")
+        self.invert_btn.setCheckable(True)
+        self.invert_btn.toggled.connect(lambda on: self._on_display("invert", on))
+        self.flip_h_btn = QtWidgets.QPushButton("Flip H")
+        self.flip_h_btn.setCheckable(True)
+        self.flip_h_btn.toggled.connect(lambda on: self._on_display("flip_h", on))
+        self.flip_v_btn = QtWidgets.QPushButton("Flip V")
+        self.flip_v_btn.setCheckable(True)
+        self.flip_v_btn.toggled.connect(lambda on: self._on_display("flip_v", on))
+        for b in (self.invert_btn, self.flip_h_btn, self.flip_v_btn):
+            row1.addWidget(b)
+        layout.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        rotate_left = QtWidgets.QPushButton("Rotate ←")
+        rotate_left.clicked.connect(lambda: self._rotate_by(1))
+        rotate_right = QtWidgets.QPushButton("Rotate →")
+        rotate_right.clicked.connect(lambda: self._rotate_by(-1))
+        reset_orient = QtWidgets.QPushButton("Reset")
+        reset_orient.clicked.connect(self._reset_display)
+        for b in (rotate_left, rotate_right, reset_orient):
+            row2.addWidget(b)
+        layout.addLayout(row2)
+
+        hint = QtWidgets.QLabel("Right-drag image: window/level.")
+        hint.setStyleSheet("color:#888;")
+        layout.addWidget(hint)
+        return box
+
+    def _on_display(self, key: str, value) -> None:
+        self._display_state[key] = bool(value) if key != "rotations" else int(value)
+        self.displayChanged.emit(dict(self._display_state))
+
+    def _rotate_by(self, k: int) -> None:
+        self._display_state["rotations"] = (self._display_state["rotations"] + k) % 4
+        self.displayChanged.emit(dict(self._display_state))
+
+    def _reset_display(self) -> None:
+        for b in (self.invert_btn, self.flip_h_btn, self.flip_v_btn):
+            b.blockSignals(True)
+            b.setChecked(False)
+            b.blockSignals(False)
+        self._display_state = {
+            "invert": False, "flip_v": False, "flip_h": False, "rotations": 0,
+        }
+        self.displayChanged.emit(dict(self._display_state))
 
     def _build_slab_group(self) -> QtWidgets.QGroupBox:
         box = QtWidgets.QGroupBox("Slab / MIP")

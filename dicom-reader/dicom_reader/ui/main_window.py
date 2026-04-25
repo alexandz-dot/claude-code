@@ -9,6 +9,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from dicom_reader.ai import is_available as seg_available
 from dicom_reader.ai.masks import SegmentationSet
+from dicom_reader.imaging.display import DisplayOptions
 from dicom_reader.imaging.fusion import resample_to
 from dicom_reader.imaging.mip import SlabMode
 from dicom_reader.imaging.reslice import Plane
@@ -138,11 +139,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._tools.slabChanged.connect(self._apply_slab)
         self._tools.segmentRequested.connect(self._run_segmentation)
         self._tools.segAlphaChanged.connect(self._apply_seg_alpha)
+        self._tools.displayChanged.connect(self._apply_display)
         self._tools.resetRequested.connect(self._reset_views)
         for vp in self._viewports():
             vp.probed.connect(self._probe_label.setText)
             vp.measured.connect(self._measure_label.setText)
             vp.crosshairMoved.connect(self._broadcast_crosshair)
+            vp.windowDragged.connect(self._sync_window_from_drag)
         self._tag_toggle.toggled.connect(self._tag_browser.setVisible)
         self._structures_panel.visibilityChanged.connect(self._on_structures_changed)
         self._structures_panel.computeStatsRequested.connect(self._compute_structure_stats)
@@ -289,6 +292,29 @@ class MainWindow(QtWidgets.QMainWindow):
         voxel = (float(k), float(j), float(i))
         for vp in self._viewports():
             vp.set_crosshair_voxel(voxel)
+
+    # --- display + W/L drag ---
+
+    def _apply_display(self, params: dict) -> None:
+        opts = DisplayOptions(
+            invert=bool(params.get("invert", False)),
+            flip_v=bool(params.get("flip_v", False)),
+            flip_h=bool(params.get("flip_h", False)),
+            rotations=int(params.get("rotations", 0)) % 4,
+        )
+        for vp in self._viewports():
+            vp.set_display_options(opts)
+
+    def _sync_window_from_drag(self, wl: WindowLevel) -> None:
+        # The drag changes the WL on the viewport that received it; mirror
+        # to the tools panel and propagate to the other viewports so all
+        # MPR planes stay in sync.
+        self._tools.set_window_values(wl)
+        sender = self.sender()
+        for vp in self._viewports():
+            if vp is sender:
+                continue
+            vp.set_window(wl)
 
     # --- slab ---
 
